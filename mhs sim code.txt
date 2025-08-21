@@ -1,0 +1,496 @@
+# app.py
+# 📦 Material Handling System (MHS) Simulator
+# Streamlit UI + SimPy discrete-event engine
+# Time unit: minutes
+
+import math
+import random
+from collections import deque, defaultdict
+
+import numpy as np
+import pandas as pd
+import simpy
+import streamlit as st
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def per_min_to_time(rate_per_min):
+    """Return deterministic service time (minutes) for one unit at a given rate."""
+    return 1.0 / max(rate_per_min, 1e-9)
+
+def ft_at(speed_fpm, distance_ft):
+    """Travel time (min) on a conveyor of given speed and distance."""
+    return distance_ft / max(speed_fpm, 1e-9)
+
+def inches_to_cases(slug_len_ft, case_len_in, gap_in):
+    per_case_in = case_len_in + gap_in
+    if per_case_in <= 0:
+        return 1
+    return max(1, int((slug_len_ft * 12.0) // per_case_in))
+
+# ----------------------------
+# Monitored "service" wrapper
+# ----------------------------
+
+class Stats:
+    def __init__(self):
+        self.res_busy = defaultdict(float)
+        self.res_wait = defaultdict(float)
+        self.res_n = defaultdict(int)
+        self.stage_ctime = []          # case cycle times
+        self.case_done_times = []      # completion timestamps (min)
+        self.debug_counts = defaultdict(int)
+
+    def add_busy(self, name, t): self.res_busy[name] += t
+    def add_wait(self, name, t): self.res_wait[name] += t
+    def inc_n(self, name): self.res_n[name] += 1
+
+def use_resource(env, res, stats: Stats, name, service_time):
+    """Request a resource, accumulate wait & busy stats, then service."""
+    t0 = env.now
+    with res.request() as req:
+        yield req
+        wait = env.now - t0
+        stats.add_wait(name, wait)
+        stats.inc_n(name)
+        # service
+        yield env.timeout(service_time)
+        stats.add_busy(name, service_time)
+
+# ----------------------------
+# Inchstore slug gate (per lane)
+# ----------------------------
+
+class InchstoreGate:
+    """
+    Holds cases until 'slug_size_cases' are accumulated, then releases them
+    in a burst. This is a pragmatic approximation of a 40 ft slug rule.
+    """
+    def __init__(self, env, slug_size_cases:int):
+        self.env = env
+        self.slug_size = max(1, slug_size_cases)
+        self.waiters = deque()
+        self.count_since_release = 0
+
+    def arrive(self):
+        """A case calls this and waits until its slug is released."""
+        ev = self.env.event()
+        self.waiters.append(ev)
+        self.count_since_release += 1
+
+        # If this case completes the slug, release the whole group
+        if self.count_since_release >= self.slug_size:
+            while self.waiters:
+                self.waiters.popleft().succeed()
+            self.count_since_release = 0
+        return ev
+
+# ----------------------------
+# Simulation core
+# ----------------------------
+
+def simulate(params):
+    """
+    Run the SimPy simulation with the provided params (dict) and return results.
+    """
+    env = simpy.Environment()
+    stats = Stats()
+
+    # ---------- Parameters ----------
+    random.seed(params["seed"])
+
+    # Inbound: trucks -> pallets -> pallet flow -> breakdown -> induction
+    trucks = params["trucks"]
+    pallets_per_truck = params["pallets_per_truck"]
+    cases_per_pallet = params["cases_per_pallet"]
+    total_cases = trucks * pallets_per_truck * cases_per_pallet
+
+    # Pallet unloading
+    forklifts_in = simpy.Resource(env, capacity=params["forklifts_in"])
+    t_unload_pallet = per_min_to_time(params["forklift_unload_rate_ppm"])  # pallet/min -> min/pallet
+    t_pallet_flow = params["pallet_flow_time_min"]                         # gravity rail float
+
+    # Breakdown to cases (workers)
+    brk_workers = simpy.Resource(env, capacity=params["breakdown_workers"])
+    t_break_one_case = per_min_to_time(params["breakdown_rate_cpm"])      # cases/min -> min/case
+
+    # Inbound conveyors to print/apply
+    t_to_pa = ft_at(params["belt_speed_inbound_fpm"], params["inbound_distance_ft"])  # ~75 ft @ 150 fpm by default
+
+    # Print & Apply + Induction lanes (6)
+    num_inductions = params["num_inductions"]
+    pa_lanes = [simpy.Resource(env, capacity=1) for _ in range(num_inductions)]
+    t_print_apply = params["print_apply_time_min"]                         # service per case
+    t_induction_handling = params["induction_handling_time_min"]           # place/trigger/etc
+
+    # Lane mapping to cell groups
+    #  Lanes 1-3 -> Alpha; 4-6 -> Bravo (adjustable with UI option)
+    def lane_to_group(idx):
+        if params["alpha_lanes"] == "1-3" and params["bravo_lanes"] == "4-6":
+            return "ALPHA" if idx < 3 else "BRAVO"
+        # fallback: even->Alpha, odd->Bravo
+        return "ALPHA" if (idx % 2 == 0) else "BRAVO"
+
+    # Cell entry gap (create headway)
+    gap_in = params["cell_gap_in"]
+    case_len_in = params["case_len_in"]
+    belt_speed_cell = params["belt_speed_cell_fpm"]
+    # headway caused by desired gap (pure gap time, not case length)
+    t_gap_only = ft_at(belt_speed_cell, gap_in / 12.0)
+
+    # Cell lanes (Alpha/Bravo)
+    cell_alpha = simpy.Resource(env, capacity=1)
+    cell_bravo = simpy.Resource(env, capacity=1)
+    t_cell_travel = params["cell_travel_time_min"]      # includes beamline dwell/travel
+    # Mezzanine/elevated travel after inchstore
+    t_elevated = ft_at(params["belt_speed_elev_fpm"], params["elev_distance_ft"])
+
+    # Inchstore (per lane)
+    slug_size_cases = inches_to_cases(params["slug_len_ft"], case_len_in, gap_in)
+    inch_alpha = InchstoreGate(env, slug_size_cases)
+    inch_bravo = InchstoreGate(env, slug_size_cases)
+    # Optional inter-case spacing when slug leaves (keep tiny to emulate bumper-to-bumper)
+    t_slug_spacing = params["slug_spacing_min"]
+
+    # 3x1 sawtooth merge (capacity 1) + scanner
+    merge = simpy.Resource(env, capacity=1)
+    t_merge = params["sawtooth_merge_cycle_min"]
+    scanner = simpy.Resource(env, capacity=1)
+    t_scan = params["scanner_time_min"]
+
+    # Sort lanes / pallet build
+    sort_lanes = params["sort_lanes"]
+    cases_per_pallet_out = params["cases_per_pallet_out"]
+    pick_workers = simpy.Resource(env, capacity=params["pallet_build_workers"])  # humans picking from gravity rollers
+    t_case_pick = params["case_pick_time_min"]
+    t_pallet_service = params["service_area_time_min"]            # cornerboards/strap per pallet
+
+    # Outbound forklifts loading pallets to truck
+    forklifts_out = simpy.Resource(env, capacity=params["forklifts_out"])
+    t_load_pallet = per_min_to_time(params["forklift_load_rate_ppm"])  # pallets/min -> min/pallet
+
+    # Efficiency multipliers (applied as 1/eff for speeds/rates)
+    eff = params["efficiency"]
+    def eff_time(t):  # lower eff => longer times
+        return t / max(eff, 1e-6)
+
+    # --------------------------
+    # Pallet build aggregator (per sort lane)
+    # --------------------------
+    lane_waiters = [deque() for _ in range(sort_lanes)]
+    lane_count_since_pallet = [0 for _ in range(sort_lanes)]
+    pallets_loaded = 0
+    all_done = env.event()  # fired when the last case finishes
+
+    def pallet_complete_flow(lane_idx):
+        """Called when a pallet at 'lane_idx' reaches full case count."""
+        nonlocal pallets_loaded
+        # All cases on that pallet wait until the pallet is fully built & serviced
+        waiters = lane_waiters[lane_idx]
+        # Worker builds pallet (time: per-case handling + any fixed time)
+        # Approximate total operator time for that pallet:
+        build_time = cases_per_pallet_out * t_case_pick
+        # One worker handles the full pallet (others can work other pallets in parallel)
+        def _work_and_load():
+            # Build & strap
+            yield from use_resource(env, pick_workers, stats, "pallet_build_workers", eff_time(build_time))
+            yield env.timeout(eff_time(t_pallet_service))
+            # Load with outbound forklift
+            yield from use_resource(env, forklifts_out, stats, "forklift_out", eff_time(t_load_pallet))
+            # Mark all its cases as complete (release their events)
+            while waiters:
+                waiters.popleft().succeed()
+            # Count pallet
+            pallets_loaded += 1
+            if stats.debug_counts["cases_completed"] >= total_cases and not all_done.triggered:
+                all_done.succeed()
+        env.process(_work_and_load())
+
+    # --------------------------
+    # Case process
+    # --------------------------
+    def case_flow(case_id, lane_idx):
+        """Full case journey from post-breakdown to truck load."""
+        # Travel to print/apply
+        yield env.timeout(eff_time(t_to_pa))
+
+        # Print & Apply + Induction
+        res = pa_lanes[lane_idx]
+        yield from use_resource(env, res, stats, f"pa_lane_{lane_idx+1}", eff_time(t_print_apply + t_induction_handling))
+
+        # To cell entry gate (alpha/bravo)
+        group = lane_to_group(lane_idx)
+        # Create gap at cell entry
+        yield env.timeout(eff_time(t_gap_only))
+
+        # Cell travel/beamline (per lane)
+        if group == "ALPHA":
+            yield from use_resource(env, cell_alpha, stats, "cell_alpha", eff_time(t_cell_travel))
+            # Inchstore hold
+            ev = inch_alpha.arrive()
+        else:
+            yield from use_resource(env, cell_bravo, stats, "cell_bravo", eff_time(t_cell_travel))
+            ev = inch_bravo.arrive()
+
+        # Wait for slug release
+        yield ev
+
+        # Elevated conveyors after slug takes off
+        yield env.timeout(eff_time(t_elevated))
+
+        # Both groups converge -> 3x1 sawtooth merge
+        yield from use_resource(env, merge, stats, "sawtooth_merge", eff_time(t_merge))
+
+        # Scanner
+        yield from use_resource(env, scanner, stats, "scanner", eff_time(t_scan))
+
+        # Send to an outbound sort lane (assign by induction lane for simplicity)
+        sort_idx = lane_idx % sort_lanes
+
+        # Queue for pallet completion at that lane
+        ev_done = env.event()
+        lane_waiters[sort_idx].append(ev_done)
+        lane_count_since_pallet[sort_idx] += 1
+
+        # If this case completes a pallet, trigger pallet build + load pipeline
+        if lane_count_since_pallet[sort_idx] >= cases_per_pallet_out:
+            lane_count_since_pallet[sort_idx] = 0
+            pallet_complete_flow(sort_idx)
+
+        # Wait until pallet is loaded to the outbound truck
+        yield ev_done
+
+        stats.debug_counts["cases_completed"] += 1
+        stats.case_done_times.append(env.now)
+
+    # --------------------------
+    # Breakdown of pallets into cases (source)
+    # --------------------------
+    def pallet_breakdown_flow(case_counter_iter):
+        """Continuously break down pallets into individual cases to feed lanes."""
+        for _ in range(cases_per_pallet):
+            # One case handled by a breakdown worker
+            yield from use_resource(env, brk_workers, stats, "breakdown_workers", eff_time(t_break_one_case))
+            # Choose an induction lane (round-robin)
+            lane_idx = next(case_counter_iter) % num_inductions
+            env.process(case_flow(next_case_id[0], lane_idx))
+            next_case_id[0] += 1
+
+    def truck_source():
+        """Trucks -> pallets -> pallet flow -> breakdown -> cases into lanes."""
+        # Deterministic arrivals (all at time 0). You can randomize if desired.
+        for _t in range(trucks):
+            for _p in range(pallets_per_truck):
+                # Unload pallet from truck
+                yield from use_resource(env, forklifts_in, stats, "forklift_in", eff_time(t_unload_pallet))
+                # Pallet flows on gravity rail to staging
+                yield env.timeout(eff_time(t_pallet_flow))
+                # Break pallet into cases (can be parallel if multiple workers)
+                env.process(pallet_breakdown_flow(case_counter_iter))
+
+    # round-robin helper
+    def rr():
+        k = 0
+        while True:
+            yield k
+            k = (k + 1) % num_inductions
+
+    case_counter_iter = rr()
+    next_case_id = [0]  # mutable counter
+
+    # Kick off
+    env.process(truck_source())
+    # Wait until all cases finish
+    env.process(wait_all_done(env, all_done))
+
+    # Run
+    env.run(until=all_done)
+
+    # ------------- Summaries -------------
+    total_time_min = max(stats.case_done_times) if stats.case_done_times else 0.0
+    total_time_hr = total_time_min / 60.0
+
+    # Utilization approximation for monitored resources
+    util = {}
+    for name, busy in stats.res_busy.items():
+        util[name] = min(1.0, busy / max(total_time_min, 1e-9))
+
+    waits = {k: (stats.res_wait[k] / max(stats.res_n[k], 1)) for k in stats.res_wait}
+
+    # Throughput curve (cases completed over time)
+    if stats.case_done_times:
+        ts = np.array(sorted(stats.case_done_times))
+        x = ts
+        y = np.arange(1, len(ts) + 1)
+        throughput_df = pd.DataFrame({"minute": x, "cases_completed": y})
+    else:
+        throughput_df = pd.DataFrame({"minute": [], "cases_completed": []})
+
+    results = {
+        "total_cases": total_cases,
+        "cases_per_pallet_out": cases_per_pallet_out,
+        "pallets_loaded": math.ceil(total_cases / cases_per_pallet_out),
+        "slug_size_cases": slug_size_cases,
+        "total_time_min": round(total_time_min, 2),
+        "total_time_hr": round(total_time_hr, 3),
+        "avg_wait_min_by_resource": waits,
+        "utilization_by_resource": util,
+        "throughput_df": throughput_df,
+    }
+    return results
+
+def wait_all_done(env, event):
+    yield event
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+
+st.set_page_config(page_title="MHS Simulator", layout="wide")
+st.title("📦 Material Handling System Simulator (Streamlit + SimPy)")
+st.caption("Time unit: minutes. Set parameters below and press **Run Simulation**.")
+
+with st.sidebar:
+    st.header("Global")
+    seed = st.number_input("Random Seed", min_value=0, value=42, step=1)
+    eff = st.slider("Overall Efficiency Factor", min_value=0.10, max_value=1.25, value=1.00, step=0.05,
+                    help="Values <1 slow everything down proportionally; >1 speeds up.")
+
+    st.header("Volumes")
+    trucks = st.number_input("Inbound Trucks", 1, 100, 4)
+    pallets_per_truck = st.number_input("Pallets per Truck", 1, 80, 28)
+    cases_per_pallet = st.number_input("Cases per Pallet (inbound)", 1, 200, 60)
+    cases_per_pallet_out = st.number_input("Cases per Pallet (outbound)", 10, 200, 60)
+
+    st.header("Box")
+    case_len_in = st.number_input("Case Length (in)", 8.0, 40.0, 22.5, 0.5)
+    cell_gap_in = st.number_input("Target Gap at Cell Entry (in)", 0.0, 24.0, 3.0, 0.5)
+    slug_len_ft = st.number_input("Max Slug Length at Inchstore (ft)", 10.0, 80.0, 40.0, 1.0)
+    slug_spacing_min = st.number_input("Inter-case spacing when slug releases (min)", 0.0, 0.2, 0.02, 0.01)
+
+    st.header("Inbound")
+    forklifts_in = st.number_input("Inbound Forklifts", 1, 10, 2)
+    forklift_unload_rate_ppm = st.number_input("Forklift unload rate (pallets/min per forklift)", 0.1, 10.0, 0.5, 0.1)
+    pallet_flow_time_min = st.number_input("Pallet flow rail time (min)", 0.0, 10.0, 0.5, 0.1)
+
+    breakdown_workers = st.number_input("Pallet breakdown workers", 1, 30, 6)
+    breakdown_rate_cpm = st.number_input("Breakdown rate (cases/min per worker)", 0.2, 80.0, 1.5, 0.1)
+
+    belt_speed_inbound_fpm = st.number_input("Inbound belt speed (ft/min)", 30.0, 500.0, 150.0, 5.0)
+    inbound_distance_ft = st.number_input("Distance Truck→P&A (ft)", 10.0, 400.0, 75.0, 5.0)
+
+    st.header("Print & Apply / Induction")
+    num_inductions = st.number_input("Induction lanes (P&A stations)", 1, 12, 6)
+    print_apply_time_min = st.number_input("Print & Apply time per case (min)", 0.01, 5.0, 0.08, 0.01)  # ~4.8s
+    induction_handling_time_min = st.number_input("Induction handling time per case (min)", 0.01, 5.0, 0.06, 0.01) # ~3.6s
+    alpha_lanes = st.selectbox("Alpha Lanes", ["1-3", "even"], index=0)
+    bravo_lanes = st.selectbox("Bravo Lanes", ["4-6", "odd"], index=0)
+
+    st.header("Cell & Outbound")
+    belt_speed_cell_fpm = st.number_input("Cell belt speed (ft/min)", 20.0, 400.0, 150.0, 5.0)
+    cell_travel_time_min = st.number_input("Cell travel+beam time per case (min)", 0.1, 10.0, 0.92, 0.02)  # ~55s default
+
+    belt_speed_elev_fpm = st.number_input("Elevated conveyor speed (ft/min)", 30.0, 500.0, 150.0, 5.0)
+    elev_distance_ft = st.number_input("Elevated distance (ft)", 10.0, 500.0, 120.0, 5.0)
+
+    sawtooth_merge_cycle_min = st.number_input("3x1 sawtooth merge cycle (min/case)", 0.01, 1.0, 0.05, 0.01)
+    scanner_time_min = st.number_input("Sorter scanner time (min/case)", 0.005, 1.0, 0.02, 0.005)
+    sort_lanes = st.number_input("Outbound sort lanes", 1, 16, 6)
+
+    st.header("Palletize & Outbound Trucks")
+    pallet_build_workers = st.number_input("Pallet build workers", 1, 50, 6)
+    case_pick_time_min = st.number_input("Pick & place time per case (min)", 0.02, 2.0, 0.10, 0.01)  # 6s per case
+    service_area_time_min = st.number_input("Service area time per pallet (strap/cboards) (min)", 0.0, 15.0, 2.0, 0.5)
+
+    forklifts_out = st.number_input("Outbound forklifts", 1, 10, 2)
+    forklift_load_rate_ppm = st.number_input("Forklift load rate (pallets/min per forklift)", 0.1, 10.0, 0.7, 0.1)
+
+run = st.button("▶ Run Simulation")
+
+# Consolidate params
+params = {
+    "seed": seed,
+    "efficiency": eff,
+
+    "trucks": int(trucks),
+    "pallets_per_truck": int(pallets_per_truck),
+    "cases_per_pallet": int(cases_per_pallet),
+
+    "forklifts_in": int(forklifts_in),
+    "forklift_unload_rate_ppm": float(forklift_unload_rate_ppm),
+    "pallet_flow_time_min": float(pallet_flow_time_min),
+
+    "breakdown_workers": int(breakdown_workers),
+    "breakdown_rate_cpm": float(breakdown_rate_cpm),
+
+    "belt_speed_inbound_fpm": float(belt_speed_inbound_fpm),
+    "inbound_distance_ft": float(inbound_distance_ft),
+
+    "num_inductions": int(num_inductions),
+    "print_apply_time_min": float(print_apply_time_min),
+    "induction_handling_time_min": float(induction_handling_time_min),
+    "alpha_lanes": alpha_lanes,
+    "bravo_lanes": bravo_lanes,
+
+    "case_len_in": float(case_len_in),
+    "cell_gap_in": float(cell_gap_in),
+    "belt_speed_cell_fpm": float(belt_speed_cell_fpm),
+    "cell_travel_time_min": float(cell_travel_time_min),
+
+    "slug_len_ft": float(slug_len_ft),
+    "slug_spacing_min": float(slug_spacing_min),
+
+    "belt_speed_elev_fpm": float(belt_speed_elev_fpm),
+    "elev_distance_ft": float(elev_distance_ft),
+
+    "sawtooth_merge_cycle_min": float(sawtooth_merge_cycle_min),
+    "scanner_time_min": float(scanner_time_min),
+    "sort_lanes": int(sort_lanes),
+
+    "pallet_build_workers": int(pallet_build_workers),
+    "case_pick_time_min": float(case_pick_time_min),
+    "service_area_time_min": float(service_area_time_min),
+
+    "forklifts_out": int(forklifts_out),
+    "forklift_load_rate_ppm": float(forklift_load_rate_ppm),
+
+    "cases_per_pallet_out": int(cases_per_pallet_out),
+}
+
+if run:
+    with st.spinner("Simulating…"):
+        res = simulate(params)
+
+    # ----------- Results -----------
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Total cases", f'{res["total_cases"]:,}')
+    colB.metric("Pallets loaded", f'{res["pallets_loaded"]:,}')
+    colC.metric("Slug size (cases)", res["slug_size_cases"])
+    colD.metric("Total time", f'{res["total_time_hr"]:.2f} hr ({res["total_time_min"]:.0f} min)')
+
+    st.subheader("Bottleneck Candidates (avg wait per resource, minutes)")
+    waits = pd.Series(res["avg_wait_min_by_resource"]).sort_values(ascending=False)
+    st.dataframe(waits.to_frame("avg_wait_min"))
+
+    st.subheader("Resource Utilization")
+    util = pd.Series(res["utilization_by_resource"]).sort_values(ascending=False)
+    st.dataframe((util*100.0).round(1).to_frame("%busy"))
+
+    st.subheader("Completion Curve (Cases Completed vs Time)")
+    df = res["throughput_df"]
+    if not df.empty:
+        fig, ax = plt.subplots()
+        ax.plot(df["minute"], df["cases_completed"])
+        ax.set_xlabel("Minute")
+        ax.set_ylabel("Cases Completed")
+        st.pyplot(fig)
+    else:
+        st.info("No completion data to plot (0 cases).")
+
+    st.caption(
+        "Tip: Raise workers/forklifts or shorten cycle times where waits/%%busy are highest. "
+        "Adjust α/β lane mapping, gap, slug length, and merge times to study their effects."
+    )
